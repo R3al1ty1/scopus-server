@@ -19,6 +19,7 @@ from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 
 from parsing.utils.const import PROJECT_DIR, FILTERS_DCT
+from parsing.unzipper import unzip_pngs
 from database.db import add_request, update_request
 
 
@@ -67,62 +68,83 @@ async def build_query_by_dialog_data(query : dict):
         files_str = ' OR '.join(files)
         files_str = f' AND ( {files_str} )'
         result = result + files_str
-    print(result)
     return result
+
+
+async def csv_download_done(browser):
+    
+    for _ in range(5):
+        try:
+            if browser.ele('xpath://*[@id="file-export-toast"]/div[1]/div/div/span[2]/div/div').text == "Your CSV file was successfully exported.":
+                browser.ele('xpath://*[@id="file-export-toast"]/button').click()
+                return True
+            else:
+                await asyncio.sleep(2)
+        except:
+            return False
+    return False
 
 
 async def get_co_authors(content, browser):
     try:
         soup = BeautifulSoup(content, "html.parser")
-
         rows = soup.find_all("tr", class_="Table-module__lCVi9")
-
         data = []
         for row in rows:
-            checkbox = row.find("input", {"type": "checkbox"})
-            author_id = checkbox["id"] if checkbox else None
-
-            name_span = row.select_one("td:nth-of-type(2) a span")
+            # Извлечение имени автора
+            name_span = row.select_one("td:nth-of-type(1) a span")
             name = name_span.get_text(strip=True) if name_span else None
 
-            doc_count_span = row.select_one("td:nth-of-type(3) a span")
+            # Извлечение количества документов
+            doc_count_span = row.select_one("td:nth-of-type(2) a span")
             doc_count = doc_count_span.get_text(strip=True) if doc_count_span else None
 
-            if author_id and name and doc_count:
+            # Извлечение авторского ID из URL
+            author_link = row.select_one("td:nth-of-type(1) a")
+            if author_link:
+                author_id_match = re.search(r'authorId=([\d]+)', author_link["href"])
+                author_id = author_id_match.group(1) if author_id_match else None
+
+            if name and doc_count and author_id:
                 data.append({
                     "id": author_id,
                     "name": name,
-                    "documents": doc_count
+                    "documents": doc_count,
+                    "orcid": "-"
                 })
+
         for i in range(len(data)):
             try:
                 auth_id = data[i]["id"]
                 print(auth_id)
                 browser.get(f"https://www.scopus.com/authid/detail.uri?authorId={auth_id}")
-                orcid = browser.ele('xpath://*[@id="scopus-author-profile-page-control-microui__general-information-content"]/div[2]/ul/li[3]').text
-                orcids_lst = orcid.split("/")
-                orcid = orcids_lst[-1]
-                if orcid.count("-") == 3:
-                    data[i]["id"] = orcid[:19]
-                else:
-                    data[i]["id"] = "-"
+                # Обновление XPath, если необходимо
+                orcid_element = browser.ele('xpath://*[@id="scopus-author-profile-page-control-microui__general-information-content"]/div[2]/ul/li[3]')
+                if orcid_element:
+                    orcid = orcid_element.text.split("/")[-1]
+                    if orcid.count("-") == 3:
+                        data[i]["id"] = orcid[:19]
+                    else:
+                        data[i]["id"] = "-"
                 browser.back()
-            except:
+            except Exception as e:
+                print(f"Error processing author {auth_id}: {e}")
                 traceback.print_exc()
 
+        print(f"co-authors: {data}")
         return data
 
-    except:
+    except Exception as e:
+        print(f"Error in get_co_authors: {e}")
+        traceback.print_exc()
         return None
 
 
 async def get_menu_name(elem_html):
     soup = BeautifulSoup(elem_html, 'html.parser')
 
-    # Находим элемент <button> с атрибутом aria-controls
     button = soup.find('button', attrs={'aria-controls': True})
 
-    # Извлекаем значение aria-controls
     if button:
         aria_controls_value = button['aria-controls']
         if aria_controls_value.startswith("menu"):
@@ -132,8 +154,10 @@ async def get_menu_name(elem_html):
 
 async def export_auth_docs(browser, doc_type):
     try:
-        browser.scroll.down(200)
-        await asyncio.sleep(2)
+        try:
+            browser.ele('Okay').click()
+        except:
+            pass
         exp = browser.ele('xpath://*[@id="documents-panel"]/div/div/div/div[2]/div[2]/ul/li[1]/div/span/button')
         displayed = exp.wait.displayed()
         if displayed:
@@ -150,6 +174,7 @@ async def export_auth_docs(browser, doc_type):
             browser.ele('xpath://*[@id="documents-panel"]/div/div/div/div[2]/div[2]/ul/li[1]/div[2]/div/div/section/div[1]/div/div/div/div/div[3]/span/label/input').click()
             browser.ele('xpath://*[@id="documents-panel"]/div/div/div/div[2]/div[2]/ul/li[1]/div[2]/div/div/section/div[2]/div/div/span[2]/div/div/button').click()
             return True
+        
         return False
     except:
         traceback.print_exc()
@@ -158,7 +183,7 @@ async def export_auth_docs(browser, doc_type):
 #global warning AND PUBYEAR > 1971 AND PUBYEAR < 2026 AND ( LIMIT-TO ( LANGUAGE , "English" ) OR LIMIT-TO ( LANGUAGE , "Russian" ) ) AND ( LIMIT-TO ( DOCTYPE , "cp" ) OR LIMIT-TO ( DOCTYPE , "re" ) OR LIMIT-TO ( DOCTYPE , "ar" ) )
 
 async def downloads_done(folder_id):
-    max_retries = 26
+    max_retries = 30
     download_dir = os.path.expanduser(f"{project_dir}/scopus_files/{folder_id}")
     file_path = os.path.join(download_dir, 'scopus.ris')
     for i in range(max_retries):
@@ -265,7 +290,6 @@ async def authorization_scopus(browser, ac):
     except DrissionPage.errors.NoRectError:
         try:
             elem = browser.ele('@id:contentEditLabel', timeout=4)
-            print ("Page is ready!")
         except TimeoutException:
             browser.quit()
             print ("Loading took too much time!")
@@ -280,7 +304,6 @@ async def prepare_for_export(browser, result):
     # choose show 50
     try:
         elem = browser.ele('xpath:/html/body/div/div/div[1]/div/div/div[3]/micro-ui/document-search-results-page/div[1]/section[2]/div/div[2]/div/div[2]/div/div[2]/div[2]/div/div/label/select/option[3]', timeout=4)
-        print ("Page is ready!")
     except TimeoutException:
         print ("Loading took too much time!")
         browser.quit()
@@ -291,7 +314,6 @@ async def prepare_for_export(browser, result):
     # show all abstract
     try:
         elem = browser.ele('xpath:/html/body/div/div/div[1]/div/div/div[3]/micro-ui/document-search-results-page/div[1]/section[2]/div/div[2]/div/div[2]/div/div[1]/table/tbody/tr/td[3]/div/div/button/span', timeout=4)
-        print ("Page is ready!")
     except TimeoutException:
         print ("Loading took too much time!")
         browser.quit()
@@ -300,7 +322,6 @@ async def prepare_for_export(browser, result):
 
     try:
         elem = browser.ele('xpath:/html/body/div/div/div[1]/div/div/div[3]/micro-ui/document-search-results-page/div[1]/section[2]/div/div[2]/div/div[2]/div/div[2]/div[1]/table', timeout=4)
-        print ("Page is ready!")
     except Exception as e:
         print('Error while logging in', e)
         traceback.print_exc()
@@ -347,7 +368,6 @@ async def prepare_for_export(browser, result):
         if (i == 7 and skip_seventh_row):
             i += 1
         i = i + 3
-    print(len(result[2]))
 
 
     # change to oldest
@@ -355,7 +375,6 @@ async def prepare_for_export(browser, result):
     try:
         await asyncio.sleep(1)
         elem = browser.ele('xpath:/html/body/div/div/div[1]/div/div/div[3]/micro-ui/document-search-results-page/div[1]/section[2]/div/div[2]/div/div[2]/div/div[1]/table/tbody/tr/td[3]/div/div/div[1]/label/select/option[2]', timeout=4)
-        print ("Page is ready!")
     except TimeoutException:
         print ("Loading took too much time!")
         browser.quit()
@@ -364,7 +383,6 @@ async def prepare_for_export(browser, result):
 
     try:
         elem = browser.ele('xpath:/html/body/div/div/div[1]/div/div/div[3]/micro-ui/document-search-results-page/div[1]/section[2]/div/div[2]/div/div[2]/div/div[2]/div[1]/table', timeout=4)
-        print ("Page is ready!")
     except TimeoutException:
         print ("Loading took too much time!")
         browser.quit()
@@ -386,13 +404,11 @@ async def prepare_for_export(browser, result):
         if (i == 7 and skip_seventh_row):
             i += 1
         i = i + 3
-    print(len(result[j]))
 
     # chage to most cited
 
     try:
         elem = browser.ele('xpath:/html/body/div/div/div[1]/div/div/div[3]/micro-ui/document-search-results-page/div[1]/section[2]/div/div[2]/div/div[2]/div/div[1]/table/tbody/tr/td[3]/div/div/div[1]/label/select/option[3]', timeout=4)
-        print ("Page is ready!")
     except TimeoutException:
         print ("Loading took too much time!")
         browser.quit()
@@ -401,7 +417,6 @@ async def prepare_for_export(browser, result):
 
     try:
         elem = browser.ele('xpath:/html/body/div/div/div[1]/div/div/div[3]/micro-ui/document-search-results-page/div[1]/section[2]/div/div[2]/div/div[2]/div/div[2]/div[1]/table', timeout=4)
-        print ("Page is ready!")
     except TimeoutException:
         print ("Loading took too much time!")
         browser.quit()
@@ -423,7 +438,6 @@ async def prepare_for_export(browser, result):
         if (i == 7 and skip_seventh_row):
             i += 1
         i = i + 3    
-    print(len(result[2]))
         
 
 async def export_file(browser, result):
@@ -431,9 +445,7 @@ async def export_file(browser, result):
     # export button
     try:
         elem = browser.ele('xpath://*[@id="container"]/micro-ui/document-search-results-page/div[1]/section[2]/div/div[2]/div/div[2]/div/div[1]/table/tbody/tr/td[2]/div/div/div[1]/span/button/span[1]', timeout=4)
-        print ("Page is ready!")
     except TimeoutException:
-        print ("Loading took too much time!")
         browser.quit()
     elem.click()
 
@@ -441,20 +453,16 @@ async def export_file(browser, result):
     # "my ris settings" button
     try:
         browser.ele('RIS', timeout=4).click()
-        print ("Page is ready!")
     except TimeoutException:
         browser.quit()
-        print ("Loading took too much time!")
 
     elem.click()
 
     # нажатие кнопки выбора кол-ва
     try:
         elem = browser.ele('xpath://*[@id="select-range"]', timeout=4)
-        print ("Page is ready!")
     except TimeoutException:
         browser.quit()
-        print ("Loading took too much time!")
 
     elem.click()    
 
@@ -462,10 +470,8 @@ async def export_file(browser, result):
     try:
         elem_left = browser.ele('xpath://*[@id="container"]/micro-ui/document-search-results-page/div[1]/section[2]/div/div[2]/div/div[2]/div/div[1]/table/tbody/tr/td[2]/div/div/div[2]/div/div/section/div[1]/div/div/div[1]/div/div/div/div/div/div/div[1]/div/label/input', timeout=4)
         elem_right = browser.ele('xpath://*[@id="container"]/micro-ui/document-search-results-page/div[1]/section[2]/div/div[2]/div/div[2]/div/div[1]/table/tbody/tr/td[2]/div/div/div[2]/div/div/section/div[1]/div/div/div[1]/div/div/div/div/div/div/div[2]/div/label/input', timeout=4)
-        print ("Page is ready!")
     except TimeoutException:
         browser.quit()
-        print ("Loading took too much time!")    
 
     num = result[1]
     num = num.replace(',', '')
@@ -477,10 +483,8 @@ async def export_file(browser, result):
     try:
         # await asyncio.sleep(3)
         elem = browser.ele('xpath:/html/body/div/div/div[1]/div/div/div[3]/micro-ui/document-search-results-page/div[1]/section[2]/div/div[2]/div/div[2]/div/div[1]/table/tbody/tr/td[2]/div/div/div[2]/div/div/section/div[2]/div/div/span[2]/div/div/button', timeout=4)
-        print ("Page is ready!")
     except TimeoutException:
         browser.quit()
-        print ("Loading took too much time!")
 
     elem.click()
 
@@ -511,7 +515,7 @@ async def download_scopus_file(query: dict, folder_id: str):
 
         # await asyncio.sleep(3)
 
-        await authorization_scopus(browser=browser, ac=ac)
+        # await authorization_scopus(browser=browser, ac=ac)
 
         await asyncio.sleep(3)
         browser.refresh()
@@ -543,7 +547,6 @@ async def download_scopus_file(query: dict, folder_id: str):
             
         
         result.append(elem.text.split()[0])
-        print(elem.text)
 
     #  ----------------------
 
@@ -557,16 +560,15 @@ async def download_scopus_file(query: dict, folder_id: str):
         #     browser.quit()
         #     return
 
-        print("flag was set and now we are waiting")
         # await flag.wait()
 
         await export_file(browser=browser, result=result)
         # добавить здесь добавление в бд
         update_request(folder_id=folder_id, result_value=result, status_field="first_status")
-        res = await downloads_done(folder_id)
-        if res:
-            # flag.set()
-            update_request(folder_id=folder_id, result_value=[], status_field="second_status")
+
+        await downloads_done(folder_id)
+        
+        update_request(folder_id=folder_id, result_value=[], status_field="second_status")
         browser.quit()
         return
     except:
@@ -586,6 +588,11 @@ async def search_for_author_cred(query: dict, folder_id: str, search_type):
     keywords = ""
     text_query = query["query"]
     query_list = text_query.split(" ")
+    typeDct = {
+        "Фамилия, имя": "full_name",
+        "Ключевые слова": "keywords",
+        "ORCID": "orcid"
+    }
     if search_type == "Фамилия, имя":
         last_name = query_list[0]
         first_name = query_list[1]
@@ -593,6 +600,8 @@ async def search_for_author_cred(query: dict, folder_id: str, search_type):
         keywords = query["query"]
     else:
         orcid = query["query"]
+
+    search_type = typeDct[search_type]
 
 
     num = '2500'
@@ -608,6 +617,7 @@ async def search_for_author_cred(query: dict, folder_id: str, search_type):
             query=query["query"],
             result=[]
         )
+
         browser = ChromiumPage(co)
         ac = Actions(browser)
         browser.set.timeouts(base=3, page_load=3)
@@ -615,9 +625,9 @@ async def search_for_author_cred(query: dict, folder_id: str, search_type):
         cf_bypasser = CloudflareBypasser(browser)
         await cf_bypasser.bypass()
 
-        await authorization_scopus(browser=browser, ac=ac)
-        browser.refresh()
+        # await authorization_scopus(browser=browser, ac=ac)
         await asyncio.sleep(2)
+        browser.refresh()
         try:
             if search_type == "keywords":
                 browser.ele('xpath://*[@id="researcher-discovery"]', timeout=4).click()
@@ -688,7 +698,7 @@ async def search_for_author_cred(query: dict, folder_id: str, search_type):
         i = 0
         result.append(auths_num)
         if search_type == "full_name":
-            for j in range(1, 13):
+            for j in range(1, 9):
                 try:
                     browser.ele('xpath://*[@id="navLoad-button"]').click()
                     browser.ele(f'xpath://*[@id="navLoad-menu"]/li[{j}]').click()
@@ -788,8 +798,8 @@ async def search_for_author_cred(query: dict, folder_id: str, search_type):
                     }
 
                 result.append(file_dict)
-            shutil.rmtree(folder_path)  # Удаляем всю папку
-            os.makedirs(folder_path)
+            # shutil.rmtree(folder_path)
+            # os.makedirs(folder_path)
         else:
             elem = browser.ele('xpath://*[@id="srchResultsList"]')
             html_content = elem.html
@@ -801,35 +811,26 @@ async def search_for_author_cred(query: dict, folder_id: str, search_type):
             await asyncio.sleep(2)
             result.append([])
 
-            # Проход по каждой строке таблицы, содержащей данные авторов
             while i < len(rows):
-                # Создаем словарь для данных текущего автора
                 author_data = {}
-
-                # Инициализация переменной input_tag
                 input_tag = None
 
-                # Извлечение ID автора
                 checkbox_div = rows[i].find("div", class_="checkbox")
                 if checkbox_div:
                     input_tag = checkbox_div.find("input", {"value": True})
                     author_data['AuthorID'] = input_tag['value'] if input_tag else "N/A"
 
-                # Извлечение имени автора из `authorResultsNamesCol` или `data-name` в `input`
                 author_col = rows[i].find("td", class_="authorResultsNamesCol")
                 if author_col and author_col.find("a"):
                     author_data['Author'] = author_col.find("a").text.strip()
                 else:
-                    # Если имени автора нет в `authorResultsNamesCol`, берем из `input`
                     author_data['Author'] = input_tag['data-name'] if input_tag else "N/A"
                 
-                # Извлечение порядкового номера автора из `label`
                 if input_tag:
                     input_id = input_tag['id']
                     label_tag = rows[i].find("label", {"for": input_id})
                     author_data['Order'] = label_tag.text.strip() if label_tag else "N/A"
 
-                # Извлечение данных из других столбцов
                 documents_col = rows[i].find("td", id=lambda x: x and x.startswith("resultsDocumentsCol"))
                 author_data['Documents'] = documents_col.text.strip() if documents_col else "N/A"
 
@@ -844,18 +845,15 @@ async def search_for_author_cred(query: dict, folder_id: str, search_type):
                 country_col = rows[i].find("td", class_="dataCol7 alignRight")
                 author_data['Country'] = country_col.text.strip() if country_col else "N/A"
 
-                # Добавление данных автора в текущую группу результатов
                 result[1].append(author_data)
 
-                # Увеличение счетчика для перехода к следующему автору
                 i += 1
 
-        # Вывод результата для проверки
         # result.append(browser)
         update_request(folder_id=folder_id, result_value=result, status_field="first_status")
         # future.set_result(result)
         # flag.set()
-        print(result)
+        browser.quit()
     except:
         traceback.print_exc()
         
@@ -875,14 +873,12 @@ async def get_author_info(author_id: str, folder_id: str):
         ac = Actions(browser)
         browser.set.timeouts(base=3, page_load=3)
         browser.get(f'https://www.scopus.com/authid/detail.uri?authorId={author_id}')
-        browser.refresh()
-        await authorization_scopus(browser=browser, ac=ac)
-        browser.get(f'https://www.scopus.com/authid/detail.uri?authorId={author_id}')
         await asyncio.sleep(2)
         try:
             browser.ele('Accept all cookies', timeout=4).click()
         except:
             pass
+        browser.refresh()
         try:
             citNum = browser.ele('xpath://*[@id="scopus-author-profile-page-control-microui__general-information-content"]/div[2]/section/div/div[1]/div/div/div/div[1]/span').text
             citDoc = browser.ele('xpath://*[@id="scopus-author-profile-page-control-microui__general-information-content"]/div[2]/section/div/div[1]/div/div/div/div[2]/span/p').text
@@ -904,12 +900,23 @@ async def get_author_info(author_id: str, folder_id: str):
 
         res.append(author_info)
         await asyncio.sleep(2)
-        
+        browser.scroll.down(700)
+        csv_ready = False
+        ris_ready = False
         csv = await export_auth_docs(browser=browser, doc_type="csv")
-        await asyncio.sleep(2)
 
-        ris = await export_auth_docs(browser=browser, doc_type="ris")
-        await asyncio.sleep(2)
+        csv_ready = await csv_download_done(browser=browser)
+
+        if csv_ready:
+
+            ris = await export_auth_docs(browser=browser, doc_type="ris")
+
+            ris_ready = await csv_download_done(browser=browser)
+
+        if ris_ready:
+            print("downloads done")
+
+        browser.scroll.up(700)
         """
         Делаем соавторов
         """
@@ -917,7 +924,7 @@ async def get_author_info(author_id: str, folder_id: str):
             browser.ele('xpath://*[@id="co-authors"]').click()
             await asyncio.sleep(1.5)
         except:
-            pass
+            print(traceback.print_exc())
 
         try:
             elem = browser.ele('xpath://*[@id="showAllCoAuthors"]/form/table')
@@ -929,8 +936,8 @@ async def get_author_info(author_id: str, folder_id: str):
 
         res.append(co_authors)
         browser.get(f'https://www.scopus.com/authid/detail.uri?authorId={author_id}')
-        browser.refresh()
         await asyncio.sleep(2)
+        browser.refresh()
         """
         Дальше идут графики
         """
@@ -1025,10 +1032,14 @@ async def get_author_info(author_id: str, folder_id: str):
             browser.ele('xpath://*[@id="export_results-data"]/span[2]/span/button[2]').click()
         except:
             pass
+        await asyncio.sleep(5)
+        dearc = await unzip_pngs(f"{project_dir}/scopus_files/{folder_id}")
 
+        if dearc:
+            pass
         # await asyncio.sleep(1.5)
         # await asyncio.sleep(1.5)
-        update_request(folder_id=folder_id, result_value=[], status_field="second_status")
+        update_request(folder_id=folder_id, result_value=res, status_field="second_status")
         #future.set_result(res)
         #flag.set()
         browser.quit()
